@@ -25,7 +25,7 @@ app.onError((err, c) => {
 		return c.json(result.fail('D1数据库未绑定<br/>D1 database not bound',502));
 	}
 
-	if (err.message?.includes('D1_ERROR: no such column') || err.message?.includes('D1_ERROR: no such table')) {
+	if (err.message?.includes('D1_ERROR: no such column')) {
 		return c.json(result.fail('请按照文档更新数据库<br/>Please update the database as documented',502));
 	}
 

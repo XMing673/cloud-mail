@@ -41,12 +41,58 @@ function requestOrigin(c) {
 	}
 }
 
+// 推送表不存在：老版本升级后还没执行过 /init。drizzle 可能把 D1 的报错包在 cause 里，两处都看。
+function isMissingTable(e) {
+	return [e?.message, e?.cause?.message].some(message => message?.includes('no such table'));
+}
+
 function clip(value, max) {
 	const str = String(value ?? '').replace(/\s+/g, ' ').trim();
 	return str.length > max ? str.slice(0, max - 1) + '…' : str;
 }
 
 const pushService = {
+
+	// 建表语句全部幂等，/init 的迁移和下面的按需建表共用这一份。
+	async createTables(c) {
+		await c.env.db.batch([
+			c.env.db.prepare(`
+				CREATE TABLE IF NOT EXISTS push_subscription (
+					subscription_id INTEGER PRIMARY KEY AUTOINCREMENT,
+					user_id INTEGER NOT NULL,
+					token TEXT NOT NULL DEFAULT '',
+					endpoint TEXT NOT NULL,
+					p256dh TEXT NOT NULL,
+					auth TEXT NOT NULL,
+					origin TEXT NOT NULL DEFAULT '',
+					create_time DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+				)
+			`),
+			c.env.db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_push_subscription_endpoint ON push_subscription(endpoint)`),
+			c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_push_subscription_user ON push_subscription(user_id)`),
+			c.env.db.prepare(`
+				CREATE TABLE IF NOT EXISTS push_vapid (
+					id INTEGER PRIMARY KEY,
+					public_key TEXT NOT NULL,
+					private_key TEXT NOT NULL
+				)
+			`)
+		]);
+	},
+
+	// 已有部署更新代码后不一定会再执行 /init，所以用户第一次开启通知时发现表不存在就直接建表再重试，
+	// 不要求管理员先手动升级数据库。
+	async withTables(c, action) {
+		try {
+			return await action();
+		} catch (e) {
+			if (!isMissingTable(e)) {
+				throw e;
+			}
+			await this.createTables(c);
+			return await action();
+		}
+	},
 
 	// 取 VAPID 密钥，没有就生成。INSERT OR IGNORE 保证并发时只有一份生效，
 	// 密钥一旦变化，之前的所有订阅都会失效。
@@ -62,13 +108,17 @@ const pushService = {
 	},
 
 	async publicKey(c) {
-		const { publicKey } = await this.vapidKeys(c);
+		const { publicKey } = await this.withTables(c, () => this.vapidKeys(c));
 		return { publicKey };
 	},
 
 	// 保存（或更新）当前设备的订阅，并绑定到当前登录会话。
 	// 返回服务端公钥，前端据此判断本地订阅是否需要用新密钥重建。
 	async subscribe(c, params, userId) {
+		return this.withTables(c, () => this.saveSubscription(c, params, userId));
+	},
+
+	async saveSubscription(c, params, userId) {
 		const endpoint = params?.endpoint;
 		const p256dh = params?.keys?.p256dh;
 		const auth = params?.keys?.auth;
@@ -108,11 +158,18 @@ const pushService = {
 		if (!params?.endpoint) {
 			return;
 		}
-		await orm(c).delete(pushSubscription).where(
-			and(
-				eq(pushSubscription.userId, userId),
-				eq(pushSubscription.endpoint, params.endpoint)))
-			.run();
+		try {
+			await orm(c).delete(pushSubscription).where(
+				and(
+					eq(pushSubscription.userId, userId),
+					eq(pushSubscription.endpoint, params.endpoint)))
+				.run();
+		} catch (e) {
+			// 表都没有，自然没有订阅可删
+			if (!isMissingTable(e)) {
+				throw e;
+			}
+		}
 	},
 
 	// 登出时清掉这个会话下的订阅，前端取消订阅失败也不会继续收到推送。
@@ -127,8 +184,10 @@ const pushService = {
 					eq(pushSubscription.token, token)))
 				.run();
 		} catch (e) {
-			// 推送表还没建（部署后未执行 init）时不能让登出失败
-			console.warn(`清理推送订阅失败：${e.message}`);
+			// 清理失败（包括推送表还没建）不能让登出失败
+			if (!isMissingTable(e)) {
+				console.warn(`清理推送订阅失败：${e.message}`);
+			}
 		}
 	},
 
@@ -140,7 +199,9 @@ const pushService = {
 			await orm(c).delete(pushSubscription).where(inArray(pushSubscription.userId, userIds)).run();
 		} catch (e) {
 			// 同上，不能让删除用户失败
-			console.warn(`清理推送订阅失败：${e.message}`);
+			if (!isMissingTable(e)) {
+				console.warn(`清理推送订阅失败：${e.message}`);
+			}
 		}
 	},
 
@@ -158,7 +219,16 @@ const pushService = {
 			return;
 		}
 
-		const list = await orm(c).select().from(pushSubscription).where(eq(pushSubscription.userId, userId)).all();
+		let list;
+		try {
+			list = await orm(c).select().from(pushSubscription).where(eq(pushSubscription.userId, userId)).all();
+		} catch (e) {
+			// 还没有任何人开启过通知（表未建），收信时不用建表也不用报错
+			if (isMissingTable(e)) {
+				return;
+			}
+			throw e;
+		}
 		if (list.length === 0) {
 			return;
 		}
