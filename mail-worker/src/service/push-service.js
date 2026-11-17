@@ -5,6 +5,7 @@ import BizError from '../error/biz-error';
 import KvConst from '../const/kv-const';
 import userContext from '../security/user-context';
 import { t } from '../i18n/i18n';
+import emailUtils from '../utils/email-utils';
 import { generateVapidKeys, isValidSubscriptionKeys, sendWebPush } from '../push/web-push';
 
 // 每个用户最多保留的设备订阅数，超出后淘汰最早的。
@@ -184,9 +185,17 @@ const pushService = {
 	// 发送单条推送。返回 true 表示推送服务确认该订阅已失效（用户删除了 App 或关闭了通知权限）。
 	async send(c, subscription, emailRow, vapid) {
 		const title = clip(emailRow.name || emailRow.sendEmail, 80) || 'Cloud Mail';
-		const subject = clip(emailRow.subject, 200);
-		// 识别出验证码时放在最前面，锁屏上就能直接看到。
-		const body = emailRow.code ? clip(`[${emailRow.code}] ${subject}`, 200) : subject;
+		// 通知正文分两行：第一行主题，第二行正文摘要（系统会按可显示的行数自行截断）。
+		// 识别出验证码时放在主题最前面，锁屏上就能直接看到。
+		const subject = clip(emailRow.code ? `[${emailRow.code}] ${emailRow.subject || ''}` : emailRow.subject, 120);
+		let preview = '';
+		try {
+			preview = clip(emailUtils.formatText(emailRow.text) || emailUtils.htmlToText(emailRow.content), 160);
+		} catch (e) {
+			// 摘要提取失败不影响推送，只发主题
+			console.warn(`提取推送摘要失败：${e.message}`);
+		}
+		const body = [subject, preview].filter(Boolean).join('\n');
 
 		// 负载采用 Declarative Web Push 格式：iOS / iPadOS 18.4+ 由系统直接展示通知，不依赖 Service Worker 被唤醒；
 		// 其它浏览器会当作普通 JSON 交给 Service Worker 的 push 事件（public/push-sw.js）展示。
