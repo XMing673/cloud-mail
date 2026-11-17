@@ -1,4 +1,5 @@
 import settingService from '../service/setting-service';
+import pushService from '../service/push-service';
 import emailUtils from '../utils/email-utils';
 import {emailConst} from "../const/entity-const";
 
@@ -41,30 +42,8 @@ const dbInit = {
 	},
 
 	async v3_6DB(c) {
-		// Web Push：设备订阅表 + VAPID 密钥表（密钥在首次订阅时自动生成）
-		await c.env.db.batch([
-			c.env.db.prepare(`
-				CREATE TABLE IF NOT EXISTS push_subscription (
-					subscription_id INTEGER PRIMARY KEY AUTOINCREMENT,
-					user_id INTEGER NOT NULL,
-					token TEXT NOT NULL DEFAULT '',
-					endpoint TEXT NOT NULL,
-					p256dh TEXT NOT NULL,
-					auth TEXT NOT NULL,
-					origin TEXT NOT NULL DEFAULT '',
-					create_time DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
-				)
-			`),
-			c.env.db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_push_subscription_endpoint ON push_subscription(endpoint)`),
-			c.env.db.prepare(`CREATE INDEX IF NOT EXISTS idx_push_subscription_user ON push_subscription(user_id)`),
-			c.env.db.prepare(`
-				CREATE TABLE IF NOT EXISTS push_vapid (
-					id INTEGER PRIMARY KEY,
-					public_key TEXT NOT NULL,
-					private_key TEXT NOT NULL
-				)
-			`)
-		]);
+		// Web Push：设备订阅表 + VAPID 密钥表。没执行过这一步也没关系，首次开启通知时会自动建表。
+		await pushService.createTables(c);
 	},
 
 	async v3_5_1DB(c) {
